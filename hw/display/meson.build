@@ -37,6 +37,7 @@ softmmu_ss.add(when: 'CONFIG_MACFB', if_true: files('macfb.c'))
 softmmu_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-fb.c'))
 
 specific_ss.add(when: 'CONFIG_VGA', if_true: files('vga.c'))
+specific_ss.add(when: 'CONFIG_VHOST_USER_VIDEO', if_true: files('vhost-user-video.c'))
 
 if config_all_devices.has_key('CONFIG_QXL')
   qxl_ss = ss.source_set()
