@@ -2,11 +2,14 @@
  * Vhost-user VIDEO virtio device
  *
  * This is the boilerplate for instantiating a vhost-user device
- * implementing a Replay Protected Memory Block (RPMB) device. This is
- * a type of flash chip that is protected from replay attacks and used
- * for tamper resistant storage. The actual back-end for this driver
- * is the vhost-user-rpmb daemon. The code here just connects up the
- * device in QEMU and allows it to be instantiated.
+ * implementing a virtio-video device.
+ *
+ * The virtio video decoder and encoder devices are virtual devices that
+ * support encoding and decoding respectively.
+ *
+ * The actual back-end for this driver is the vhost-user-video daemon.
+ * The code here just connects up the device in QEMU and allows it to
+ * be instantiated.
  *
  * Copyright (c) 2021 Linaro Ltd
  *
@@ -85,7 +88,7 @@ err_host_notifiers:
 
 static void vhost_user_video_stop(VirtIODevice *vdev)
 {
-    VHostUserRPMB *video = VHOST_USER_VIDEO(vdev);
+    VHostUserVIDEO *video = VHOST_USER_VIDEO(vdev);
     BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
     int ret;
@@ -102,12 +105,12 @@ static void vhost_user_video_stop(VirtIODevice *vdev)
         return;
     }
 
-    vhost_dev_disable_notifiers(&rpmb->vhost_dev, vdev);
+    vhost_dev_disable_notifiers(&video->vhost_dev, vdev);
 }
 
 static void vhost_user_video_set_status(VirtIODevice *vdev, uint8_t status)
 {
-    VHostUserRPMB *video = VHOST_USER_VIDEO(vdev);
+    VHostUserVIDEO *video = VHOST_USER_VIDEO(vdev);
     bool should_start = status & VIRTIO_CONFIG_S_DRIVER_OK;
 
     if (!vdev->vm_running) {
@@ -140,7 +143,7 @@ static uint64_t vhost_user_video_get_features(VirtIODevice *vdev,
        VIRTIO_VIDEO_F_RESOURCE_VIRTIO_OBJECT */
 
     /* for now just set guest pages */
-    virtio_add_feature(&features, VIRTIO_VIDEO_F_RESOURCE_GUEST_PAGES);
+    virtio_add_feature(&requested_features, VIRTIO_VIDEO_F_RESOURCE_GUEST_PAGES);
     
     return requested_features;
 }
@@ -194,7 +197,7 @@ const VhostDevConfigOps video_ops = {
 static int vhost_user_video_connect(DeviceState *dev)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
-    VHostUserRPMB *video = VHOST_USER_RPMB(vdev);
+    VHostUserVIDEO *video = VHOST_USER_VIDEO(vdev);
 
     if (video->connected) {
         return 0;
@@ -234,7 +237,7 @@ static void vhost_user_video_event(void *opaque, QEMUChrEvent event)
 
     switch (event) {
     case CHR_EVENT_OPENED:
-        if (vhost_user_video_connect(dev) {
+        if (vhost_user_video_connect(dev) < 0) {
             qemu_chr_fe_disconnect(&video->conf.chardev);
             return;
         }
@@ -302,10 +305,10 @@ static void vhost_user_video_device_realize(DeviceState *dev, Error **errp)
     return;
 }
 
-static void vurpmb_device_unrealize(DeviceState *dev)
+static void vhost_user_video_device_unrealize(DeviceState *dev)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
-    VHostUserRPMB *video = VHOST_USER_VIDEO(dev);
+    VHostUserVIDEO *video = VHOST_USER_VIDEO(dev);
 
     /* This will stop vhost backend if appropriate. */
     vhost_user_video_set_status(vdev, 0);
