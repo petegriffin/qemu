@@ -29,3 +29,11 @@ have_virtiorpmb = (have_system and
 if have_virtiorpmb
   subdir('vhost-user-rpmb')
 endif
+
+have_virtiovideo = (have_system and
+    have_tools and
+    'CONFIG_LINUX' in config_host)
+
+if have_virtiorvideo
+  subdir('vhost-user-video')
+endif
