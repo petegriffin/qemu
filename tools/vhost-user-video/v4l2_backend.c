@@ -18,14 +18,47 @@
 #include <glib.h>
 #include <glib/gstdio.h>
 
-#include <stdbool.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
+#include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #include "v4l2_backend.h"
+#include "virtio_video_helpers.h"
 
-#define ARRAY_SIZE(a)	(sizeof(a)/sizeof((a)[0]))
+#include "standard-headers/linux/virtio_video.h"
+
+/* function prototypes */
+
+bool video_is_mplane(enum v4l2_buf_type type);
+bool video_is_splane(enum v4l2_buf_type type);
+bool video_is_meta(struct v4l2_device *dev);
+bool video_is_capture(struct v4l2_device *dev);
+bool video_is_output(struct v4l2_device *dev);
+static const struct v4l2_format_info *v4l2_format_by_fourcc(unsigned int fourcc);
+static const struct v4l2_format_info *v4l2_format_by_name(const char *name);
+static const char *v4l2_format_name(unsigned int fourcc);
+static const char *v4l2_buf_type_name(enum v4l2_buf_type type);
+static const char *v4l2_field_name(enum v4l2_field field);
+static int v4l2_open(struct v4l2_device *dev, const gchar *devname);
+static int video_enum_frame_intervals(struct v4l2_device *dev, __u32 pixelformat,
+                                      unsigned int width, unsigned int height, GList **p_vid_fmt_frm_rate_l);
+
+static int video_enum_frame_sizes(struct v4l2_device *dev, __u32 pixelformat, GList **p_vid_fmt_frm_l);
+static int cap_get_buf_type(unsigned int capabilities);
+static int video_querycap(struct v4l2_device *dev, unsigned int *capabilities);
+void video_device_type(struct v4l2_device *dev, enum v4l2_buf_type type, struct v4l2_fmtdesc *fmt_desc);
+int v4l2_video_get_format(struct v4l2_device *dev, enum v4l2_buf_type type, struct v4l2_format *fmt);
+
+int v4l2_video_set_format(struct v4l2_device *dev, enum v4l2_buf_type type,
+                                 unsigned int w, unsigned int h, unsigned int format, unsigned int stride,
+                                 unsigned int buffer_size, enum v4l2_field field,
+                          unsigned int flags);
+
+void video_free_frame_intervals( GList *frm_intervals_l);
+void video_free_frame_sizes( GList *frm_sz_l);
 
 static struct v4l2_format_info {
 	const char *name;
@@ -106,6 +139,37 @@ static struct v4l2_format_info {
 	{ "MPEG", V4L2_PIX_FMT_MPEG, 1 },
 	{ "FWHT", V4L2_PIX_FMT_FWHT, 1 },
 };
+
+bool video_is_mplane(enum v4l2_buf_type type)
+{
+        return type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE ||
+               type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+}
+
+bool video_is_splane(enum v4l2_buf_type type)
+{
+        return type == V4L2_BUF_TYPE_VIDEO_CAPTURE ||
+               type == V4L2_BUF_TYPE_VIDEO_OUTPUT;
+}
+bool video_is_meta(struct v4l2_device *dev)
+{
+        return dev->type == V4L2_BUF_TYPE_META_CAPTURE ||
+               dev->type == V4L2_BUF_TYPE_META_OUTPUT;
+}
+
+bool video_is_capture(struct v4l2_device *dev)
+{
+        return dev->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE ||
+               dev->type == V4L2_BUF_TYPE_VIDEO_CAPTURE ||
+               dev->type == V4L2_BUF_TYPE_META_CAPTURE;
+}
+
+bool video_is_output(struct v4l2_device *dev)
+{
+        return dev->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ||
+               dev->type == V4L2_BUF_TYPE_VIDEO_OUTPUT ||
+               dev->type == V4L2_BUF_TYPE_META_OUTPUT;
+}
 
 static const struct v4l2_format_info *v4l2_format_by_fourcc(unsigned int fourcc)
 {
@@ -197,6 +261,34 @@ static const char *v4l2_buf_type_name(enum v4l2_buf_type type)
         return "Unknown";
 }
 
+static const struct {
+        const char *name;
+        enum v4l2_field field;
+} fields[] = {
+        { "any", V4L2_FIELD_ANY },
+        { "none", V4L2_FIELD_NONE },
+        { "top", V4L2_FIELD_TOP },
+        { "bottom", V4L2_FIELD_BOTTOM },
+        { "interlaced", V4L2_FIELD_INTERLACED },
+        { "seq-tb", V4L2_FIELD_SEQ_TB },
+        { "seq-bt", V4L2_FIELD_SEQ_BT },
+        { "alternate", V4L2_FIELD_ALTERNATE },
+        { "interlaced-tb", V4L2_FIELD_INTERLACED_TB },
+        { "interlaced-bt", V4L2_FIELD_INTERLACED_BT },
+};
+
+static const char *v4l2_field_name(enum v4l2_field field)
+{
+        unsigned int i;
+
+        for (i = 0; i < ARRAY_SIZE(fields); ++i) {
+                if (fields[i].field == field)
+                        return fields[i].name;
+        }
+
+        return "unknown";
+}
+
 static int v4l2_open(struct v4l2_device *dev, const gchar *devname)
 {
 
@@ -213,12 +305,14 @@ static int v4l2_open(struct v4l2_device *dev, const gchar *devname)
     return 0;
 }
 
-static void video_enum_frame_intervals(struct v4l2_device *dev, __u32 pixelformat,
-	unsigned int width, unsigned int height)
+static int video_enum_frame_intervals(struct v4l2_device *dev, __u32 pixelformat,
+                                       unsigned int width, unsigned int height, GList **p_vid_fmt_frm_rate_l)
 {
     struct v4l2_frmivalenum ival;
+    GList *vid_fmt_frm_rate_l;
+    struct video_format_frame_rates *vid_fmt_frm_rate;
     unsigned int i;
-    int ret;
+    int ret = 0;
 
     for (i = 0; ; ++i) {
         memset(&ival, 0, sizeof ival);
@@ -228,7 +322,10 @@ static void video_enum_frame_intervals(struct v4l2_device *dev, __u32 pixelforma
         ival.height = height;
         ret = ioctl(dev->fd, VIDIOC_ENUM_FRAMEINTERVALS, &ival);
         if (ret < 0) {
-            g_print("%s: ret=%d i=%d\n", __func__, ret, i);
+            if (errno == EINVAL) /* EINVAL means no more frame intervals */
+                ret = 0;
+            else
+                g_printerr("%s: VIDIOC_ENUM_FRAMEINTERVALS failed %s\n", __func__, g_strerror(errno));
             break;
         }
 
@@ -249,11 +346,19 @@ static void video_enum_frame_intervals(struct v4l2_device *dev, __u32 pixelforma
         if (i != 0)
             g_print(", ");
 
+        /* allocate video_format_frame */
+        vid_fmt_frm_rate = g_new0(struct video_format_frame_rates, 1);
+        /* keep a copy of v4l2 frmsizeenum struct */
+        memcpy (&vid_fmt_frm_rate->v4l_ival, &ival, sizeof (struct v4l2_frmivalenum));
+
         switch (ival.type) {
         case V4L2_FRMIVAL_TYPE_DISCRETE:
             g_debug("%u/%u",
                     ival.discrete.numerator,
                     ival.discrete.denominator);
+
+            vid_fmt_frm_rate->frame_rates.min = ival.discrete.denominator;
+            
             break;
 
         case V4L2_FRMIVAL_TYPE_CONTINUOUS:
@@ -262,7 +367,12 @@ static void video_enum_frame_intervals(struct v4l2_device *dev, __u32 pixelforma
                     ival.stepwise.min.denominator,
                     ival.stepwise.max.numerator,
                     ival.stepwise.max.denominator);
-            return;
+
+            vid_fmt_frm_rate->frame_rates.min = ival.stepwise.min.denominator;
+            vid_fmt_frm_rate->frame_rates.max = ival.stepwise.max.denominator;
+            vid_fmt_frm_rate->frame_rates.step = 1;
+                
+            goto out;
 
         case V4L2_FRMIVAL_TYPE_STEPWISE:
             g_debug("%u/%u - %u/%u (by %u/%u)",
@@ -272,27 +382,51 @@ static void video_enum_frame_intervals(struct v4l2_device *dev, __u32 pixelforma
                     ival.stepwise.max.denominator,
                     ival.stepwise.step.numerator,
                     ival.stepwise.step.denominator);
-            return;
+            
+            vid_fmt_frm_rate->frame_rates.min = ival.stepwise.min.denominator;
+            vid_fmt_frm_rate->frame_rates.max = ival.stepwise.max.denominator;
+            vid_fmt_frm_rate->frame_rates.step = ival.stepwise.step.denominator;
+            
+            goto out;
 
         default:
             break;
         }
     }
+
+out:
+    if (ret == 0) {
+        g_print("\n%s: Enumerated %d frame intervals \n", __func__, g_list_length(vid_fmt_frm_rate_l));
+        g_return_val_if_fail (i == g_list_length(vid_fmt_frm_rate_l), -EINVAL);
+        *p_vid_fmt_frm_rate_l = vid_fmt_frm_rate_l;
+    }
+
+    return ret;
 }
 
-static void video_enum_frame_sizes(struct v4l2_device *dev, __u32 pixelformat)
+static int video_enum_frame_sizes(struct v4l2_device *dev, __u32 pixelformat, GList **p_vid_fmt_frm_l)
 {
     struct v4l2_frmsizeenum frame;
+    struct video_format_frame *vid_frame;
+    GList *vid_fmt_frm_l = NULL;
     unsigned int i;
     int ret;
+
+    if (!dev)
+        return -EINVAL;
 
     for (i = 0; ; ++i) {
         memset(&frame, 0, sizeof frame);
         frame.index = i;
         frame.pixel_format = pixelformat;
         ret = ioctl(dev->fd, VIDIOC_ENUM_FRAMESIZES, &frame);
-        if (ret < 0)
+        if (ret < 0) {
+            if (errno == EINVAL) /* EINVAL means no more frame sizes */
+                ret = 0;
+            else
+                g_printerr("%s: VIDIOC_ENUM_FRAMESIZES failed %s\n", __func__, g_strerror(errno));
             break;
+        }
 
         if (i != frame.index)
             g_printerr("Warning: driver returned wrong frame index "
@@ -301,12 +435,26 @@ static void video_enum_frame_sizes(struct v4l2_device *dev, __u32 pixelformat)
             g_printerr("Warning: driver returned wrong frame pixel "
                        "format %08x.\n", frame.pixel_format);
 
+        /* allocate video_format_frame */
+        vid_frame = g_new0(struct video_format_frame, 1);
+        /* keep a copy of v4l2 frmsizeenum struct */
+        memcpy (&vid_frame->v4l_framesize, &frame, sizeof (struct v4l2_frmsizeenum));
+        vid_fmt_frm_l = g_list_append(vid_fmt_frm_l, vid_frame);
+
         switch (frame.type) {
         case V4L2_FRMSIZE_TYPE_DISCRETE:
             g_debug("\tFrame size (D): %ux%u (", frame.discrete.width,
                     frame.discrete.height);
-            video_enum_frame_intervals(dev, frame.pixel_format,
-                                       frame.discrete.width, frame.discrete.height);
+
+            vid_frame->frame.width.min = htole32(frame.discrete.width);
+            vid_frame->frame.width.max = htole32(frame.discrete.width);
+            vid_frame->frame.height.min = htole32(frame.discrete.height);
+            vid_frame->frame.height.max = htole32(frame.discrete.height);           
+            
+            if (video_enum_frame_intervals(dev, frame.pixel_format,
+                                       frame.discrete.width, frame.discrete.height,
+                                           &vid_frame->frm_rate_l) < 0)
+                g_printerr("%s: video_enum_frame_intervals failed!", __func__);
             g_debug(")");
             break;
 
@@ -316,9 +464,20 @@ static void video_enum_frame_sizes(struct v4l2_device *dev, __u32 pixelformat)
                     frame.stepwise.min_height,
                     frame.stepwise.max_width,
                     frame.stepwise.max_height);
-            video_enum_frame_intervals(dev, frame.pixel_format,
+
+            vid_frame->frame.width.min = htole32(frame.stepwise.min_width);
+            vid_frame->frame.width.max = htole32(frame.stepwise.max_width);
+            vid_frame->frame.width.step = htole32(frame.stepwise.step_width);
+            vid_frame->frame.height.min = htole32(frame.stepwise.min_height);
+            vid_frame->frame.height.max = htole32(frame.stepwise.max_height);
+            vid_frame->frame.height.step = htole32(frame.stepwise.step_height);
+
+            if (video_enum_frame_intervals(dev, frame.pixel_format,
                                        frame.stepwise.max_width,
-                                       frame.stepwise.max_height);
+                                       frame.stepwise.max_height,
+                                           &vid_frame->frm_rate_l) < 0 )
+                g_printerr("%s: video_enum_frame_intervals failed!", __func__);
+
             g_debug(")");
             break;
 
@@ -330,9 +489,20 @@ static void video_enum_frame_sizes(struct v4l2_device *dev, __u32 pixelformat)
                     frame.stepwise.max_height,
                     frame.stepwise.step_width,
                     frame.stepwise.step_height);
-            video_enum_frame_intervals(dev, frame.pixel_format,
+
+            vid_frame->frame.width.min = htole32(frame.stepwise.min_width);
+            vid_frame->frame.width.max = htole32(frame.stepwise.max_width);
+            vid_frame->frame.width.step = htole32(frame.stepwise.step_width);
+            vid_frame->frame.height.min = htole32(frame.stepwise.min_height);
+            vid_frame->frame.height.max = htole32(frame.stepwise.max_height);
+            vid_frame->frame.height.step = htole32(frame.stepwise.step_height);
+
+            if (video_enum_frame_intervals(dev, frame.pixel_format,
                                        frame.stepwise.max_width,
-                                       frame.stepwise.max_height);
+                                       frame.stepwise.max_height,
+                                       &vid_frame->frm_rate_l) < 0 )
+                g_printerr("%s: video_enum_frame_intervals failed!", __func__);
+
             g_debug(")");
             break;
 
@@ -340,6 +510,88 @@ static void video_enum_frame_sizes(struct v4l2_device *dev, __u32 pixelformat)
             break;
         }
     }
+    if (ret == 0) {
+        g_print("\n%s: Enumerated %d frame sizes and %d frame intervals\n",
+                __func__, g_list_length(vid_fmt_frm_l), g_list_length(vid_frame->frm_rate_l));
+
+        vid_frame->frame.num_rates = htole32(g_list_length(vid_frame->frm_rate_l));
+        
+        g_return_val_if_fail (i == g_list_length(vid_fmt_frm_l), -EINVAL);
+        *p_vid_fmt_frm_l = vid_fmt_frm_l;
+    }
+
+    return ret;
+}
+
+static int cap_get_buf_type(unsigned int capabilities)
+{
+        if (capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
+                return V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        } else if (capabilities & V4L2_CAP_VIDEO_OUTPUT_MPLANE) {
+                return V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        } else if (capabilities & V4L2_CAP_VIDEO_CAPTURE) {
+                return  V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        } else if (capabilities & V4L2_CAP_VIDEO_OUTPUT) {
+                return V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        } else if (capabilities & V4L2_CAP_META_CAPTURE) {
+                return V4L2_BUF_TYPE_META_CAPTURE;
+        } else if (capabilities & V4L2_CAP_META_OUTPUT) {
+                return V4L2_BUF_TYPE_META_OUTPUT;
+        } else {
+                g_print("Device supports neither capture nor output. (caps 0x%x)\n", capabilities);
+                //return -EINVAL;
+        }
+
+        return 0;
+}
+
+static int video_querycap(struct v4l2_device *dev, unsigned int *capabilities)
+{
+        struct v4l2_capability cap;
+        unsigned int caps;
+        bool has_video;
+        bool has_meta;
+        bool has_capture;
+        bool has_output;
+        bool has_mplane;
+        int ret;
+
+        memset(&cap, 0, sizeof cap);
+        ret = ioctl(dev->fd, VIDIOC_QUERYCAP, &cap);
+        if (ret < 0)
+                return 0;
+
+        caps = cap.capabilities & V4L2_CAP_DEVICE_CAPS
+             ? cap.device_caps : cap.capabilities;
+
+        has_video = caps & (V4L2_CAP_VIDEO_CAPTURE_MPLANE |
+                            V4L2_CAP_VIDEO_CAPTURE |
+                            V4L2_CAP_VIDEO_OUTPUT_MPLANE |
+                            V4L2_CAP_VIDEO_OUTPUT);
+        has_meta = caps & (V4L2_CAP_META_CAPTURE |
+                           V4L2_CAP_META_OUTPUT);
+        has_capture = caps & (V4L2_CAP_VIDEO_CAPTURE_MPLANE |
+                              V4L2_CAP_VIDEO_CAPTURE |
+                              V4L2_CAP_META_CAPTURE);
+        has_output = caps & (V4L2_CAP_VIDEO_OUTPUT_MPLANE |
+                             V4L2_CAP_VIDEO_OUTPUT |
+                             V4L2_CAP_META_OUTPUT);
+        has_mplane = caps & (V4L2_CAP_VIDEO_CAPTURE_MPLANE |
+                             V4L2_CAP_VIDEO_OUTPUT_MPLANE);
+
+        g_print("Device `%s' on `%s' (driver '%s') supports%s%s%s%s %s mplanes.\n",
+                cap.card, cap.bus_info, cap.driver,
+                has_video ? " video," : "",
+                has_meta ? " meta-data," : "",
+                has_capture ? " capture," : "",
+                has_output ? " output," : "",
+                has_mplane ? "with" : "without");
+
+        *capabilities = caps;
+
+        dev->type = cap_get_buf_type(caps);
+
+        return 0;
 }
 
 void video_device_type(struct v4l2_device *dev, enum v4l2_buf_type type, struct v4l2_fmtdesc *fmt_desc)
@@ -380,19 +632,133 @@ void video_device_type(struct v4l2_device *dev, enum v4l2_buf_type type, struct 
     }
 }
 
-static int video_enum_formats(struct v4l2_device *dev, enum v4l2_buf_type type, unsigned int *num_fmts, GArray *fmtdesc)
+int v4l2_video_get_format(struct v4l2_device *dev, enum v4l2_buf_type type, struct v4l2_format *fmt)
 {
-    struct v4l2_fmtdesc fmt;
-    unsigned int index;
-    int ret = 0;
+    unsigned int i;
+    int ret;
+
+    if (!fmt)
+        return -EINVAL;
 
     if (!dev)
         return -EINVAL;
 
-    if (!num_fmts)
-        return -EINVAL;
+    memset(fmt, 0, sizeof (struct v4l2_format));
+    fmt->type = type;
 
-    if (!fmtdesc)
+    ret = ioctl(dev->fd, VIDIOC_G_FMT, fmt);
+    if (ret < 0) {
+        g_printerr("Unable to get format: %s (%d).\n", strerror(errno),
+               errno);
+        return ret;
+    }
+
+    if (video_is_mplane(dev->type)) {
+        dev->width = fmt->fmt.pix_mp.width;
+        dev->height = fmt->fmt.pix_mp.height;
+        dev->num_planes = fmt->fmt.pix_mp.num_planes;
+
+        g_print("Video format: %s (%08x) %ux%u field %s, %u planes: \n",
+               v4l2_format_name(fmt->fmt.pix_mp.pixelformat), fmt->fmt.pix_mp.pixelformat,
+               fmt->fmt.pix_mp.width, fmt->fmt.pix_mp.height,
+               v4l2_field_name(fmt->fmt.pix_mp.field),
+               fmt->fmt.pix_mp.num_planes);
+
+        for (i = 0; i < fmt->fmt.pix_mp.num_planes; i++) {
+            dev->plane_fmt[i].bytesperline =
+                fmt->fmt.pix_mp.plane_fmt[i].bytesperline;
+            dev->plane_fmt[i].sizeimage =
+                fmt->fmt.pix_mp.plane_fmt[i].bytesperline ?
+                fmt->fmt.pix_mp.plane_fmt[i].sizeimage : 0;
+
+            g_print(" * Stride %u, buffer size %u\n",
+                   fmt->fmt.pix_mp.plane_fmt[i].bytesperline,
+                   fmt->fmt.pix_mp.plane_fmt[i].sizeimage);
+        }
+    } else if (video_is_meta(dev)) {
+        dev->width = 0;
+        dev->height = 0;
+        dev->num_planes = 1;
+
+        g_print("Meta-data format: %s (%08x) buffer size %u\n",
+               v4l2_format_name(fmt->fmt.meta.dataformat), fmt->fmt.meta.dataformat,
+               fmt->fmt.meta.buffersize);
+    } else {
+        dev->width = fmt->fmt.pix.width;
+        dev->height = fmt->fmt.pix.height;
+        dev->num_planes = 1;
+
+        dev->plane_fmt[0].bytesperline = fmt->fmt.pix.bytesperline;
+        dev->plane_fmt[0].sizeimage = fmt->fmt.pix.bytesperline ? fmt->fmt.pix.sizeimage : 0;
+
+        g_print("Video format: %s (%08x) %ux%u (stride %u) field %s buffer size %u\n",
+               v4l2_format_name(fmt->fmt.pix.pixelformat), fmt->fmt.pix.pixelformat,
+               fmt->fmt.pix.width, fmt->fmt.pix.height, fmt->fmt.pix.bytesperline,
+               v4l2_field_name(fmt->fmt.pix_mp.field),
+               fmt->fmt.pix.sizeimage);
+    }
+
+    return 0;
+}
+
+int v4l2_video_set_format(struct v4l2_device *dev, enum v4l2_buf_type type,
+                                 unsigned int w, unsigned int h, unsigned int format, unsigned int stride,
+                                 unsigned int buffer_size, enum v4l2_field field,
+                                 unsigned int flags)
+
+{
+    struct v4l2_format fmt;
+    int ret;
+    unsigned int i;
+
+    memset(&fmt, 0, sizeof fmt);
+    fmt.type = type;
+
+    if (video_is_mplane(dev->type)) {
+        const struct v4l2_format_info *info = v4l2_format_by_fourcc(format);
+
+        fmt.fmt.pix_mp.width = w;
+        fmt.fmt.pix_mp.height = h;
+        fmt.fmt.pix_mp.pixelformat = format;
+        fmt.fmt.pix_mp.field = field;
+        fmt.fmt.pix_mp.num_planes = info->n_planes;
+        fmt.fmt.pix_mp.flags = flags;
+
+        for (i = 0; i < fmt.fmt.pix_mp.num_planes; i++) {
+            fmt.fmt.pix_mp.plane_fmt[i].bytesperline = stride;
+            fmt.fmt.pix_mp.plane_fmt[i].sizeimage = buffer_size;
+        }
+    } else if (video_is_meta(dev)) {
+        fmt.fmt.meta.dataformat = format;
+        fmt.fmt.meta.buffersize = buffer_size;
+    } else {
+        fmt.fmt.pix.width = w;
+        fmt.fmt.pix.height = h;
+        fmt.fmt.pix.pixelformat = format;
+        fmt.fmt.pix.field = field;
+        fmt.fmt.pix.bytesperline = stride;
+        fmt.fmt.pix.sizeimage = buffer_size;
+        fmt.fmt.pix.priv = V4L2_PIX_FMT_PRIV_MAGIC;
+        fmt.fmt.pix.flags = flags;
+    }
+    
+    ret = ioctl(dev->fd, VIDIOC_S_FMT, &fmt);
+    if (ret < 0) {
+        g_printerr("Unable to set format: %s (%d).\n", strerror(errno),
+               errno);
+        return ret;
+    }
+}
+
+int video_enum_formats(struct v4l2_device *dev, enum v4l2_buf_type type, GList **p_fmt_list, bool only_enum_fmt)
+{
+    struct v4l2_fmtdesc fmt;
+    struct video_format *vid_fmt;
+    GList *fmt_list=NULL;
+    unsigned int index;
+    int ret = 0;
+
+    if (!dev)
         return -EINVAL;
 
     for (index = 0; ; ++index) {
@@ -421,30 +787,168 @@ static int video_enum_formats(struct v4l2_device *dev, enum v4l2_buf_type type, 
         g_debug("\tType: %s (%u)", v4l2_buf_type_name(fmt.type),
                fmt.type);
         g_debug("\tName: %.32s", fmt.description);
-        video_enum_frame_sizes(dev, fmt.pixelformat);
 
+        /* allocate video_format struct */
+        vid_fmt = g_new0(struct video_format, 1);
+
+        /* keep a copy of v4l2 struct */
+        memcpy (&vid_fmt->fmt, &fmt, sizeof (struct v4l2_fmtdesc));
+
+        /* add it to linked list */
+        fmt_list = g_list_append(fmt_list, vid_fmt);
+
+        if (!only_enum_fmt) {
+            /* pass video_format to enum_frame_sizes */
+            ret = video_enum_frame_sizes(dev, fmt.pixelformat, &vid_fmt->vid_fmt_frm_l);
+            if (ret < 0) {
+                g_printerr("video_enum_frame_sizes failed\n");
+            }
+
+            /* convert to virtio format*/
+            v4l2_to_virtio_fmtdesc(dev, vid_fmt, type);
+        }
+
+        /* determine the type of device */
         video_device_type(dev, type, &fmt);
-
-        g_array_append_val(fmtdesc, fmt);
     }
 
     if (ret == 0) {
         g_print("%s: Enumerated %d formats on type(%s)\n", __func__, index, v4l2_buf_type_name(type));
-        *num_fmts = index;
+        g_print("%s: Enumerated %d frame sizes\n", __func__, g_list_length(vid_fmt->vid_fmt_frm_l));
+        g_return_val_if_fail (index == g_list_length(fmt_list), -EINVAL);
+        
+        *p_fmt_list = fmt_list;
     }
 
     return ret;
 }
 
-static void v4l2_backend_free(const struct v4l2_device *dev)
+void video_free_frame_intervals( GList *frm_intervals_l)
+{
+    GList *l;
+    struct video_format_frame_rates *vid_fmt_frm_rate;
+    for (l = frm_intervals_l; l != NULL; l = l->next)
+    {
+        vid_fmt_frm_rate = l->data;
+        //if (vid_fmt_frm_rate->frm_rate_l)
+        g_free(vid_fmt_frm_rate);
+    }
+}
+
+void video_free_frame_sizes( GList *frm_sz_l)
+{
+    GList *l;
+    struct video_format_frame *vid_frame;
+    for (l = frm_sz_l; l != NULL; l = l->next)
+    {
+        vid_frame = l->data;
+        if (vid_frame->frm_rate_l)
+            video_free_frame_intervals(vid_frame->frm_rate_l);
+
+        g_free(vid_frame);
+    }
+}
+
+void video_free_formats( GList **fmt_l)
+{
+    GList *l;
+    struct video_format *vid_fmt;
+    
+    for (l = *fmt_l; l != NULL; l = l->next)
+    {
+        vid_fmt = l->data;
+        if (vid_fmt->vid_fmt_frm_l)
+            video_free_frame_sizes(vid_fmt->vid_fmt_frm_l);
+
+        g_free(vid_fmt);
+    }
+}
+
+void create_query_cap_resp( struct virtio_video_query_capability *qcmd, GList **fmt_l, replybuf *rbuf)
+{
+    GList *l;
+    GList *fmt_frm_l;
+    GList *frm_rate_l;
+
+    struct video_format *vid_fmt;
+    struct video_format_frame *vid_fmt_frm;
+    struct video_format_frame_rates *vid_fmt_frm_rate;
+
+    struct virtio_video_query_capability_resp *cap_resp;
+    struct virtio_video_format_desc *fmt_dsc;
+    struct virtio_video_format_frame *fmt_frame;
+    struct virtio_video_format_range *frame_rate;
+
+    l = *fmt_l;
+    g_debug("%s: rbuf->base=0x%p\n", __func__, rbuf->buf_base);
+    assert (MAX_CAPS_LEN > sizeof(struct virtio_video_query_capability_resp));
+    cap_resp = (struct virtio_video_query_capability_resp *) rbuf->buf_pos;
+
+    cap_resp->hdr.type = le32toh(qcmd->hdr.type);
+    cap_resp->hdr.stream_id = le32toh(qcmd->hdr.stream_id);
+    cap_resp->num_descs = htole32(g_list_length(*fmt_l));
+    g_debug("%s: QueryCapability num_descs = %d", __func__, le32toh(cap_resp->num_descs));
+
+    assert(le32toh(cap_resp->num_descs) < MAX_FMT_DESCS);
+
+    inc_rbuf_pos(rbuf, sizeof (struct virtio_video_query_capability_resp));
+
+    for (; l != NULL; l = l->next)
+    {
+        vid_fmt = l->data;
+        memcpy (rbuf->buf_pos, &vid_fmt->desc, sizeof (struct virtio_video_format_desc));
+        
+        //buf_pos += sizeof (struct virtio_video_format_desc);
+        inc_rbuf_pos(rbuf, sizeof (struct virtio_video_format_desc));
+        fmt_dsc = (struct virtio_video_format_desc*) rbuf->buf_pos;
+
+        /* does video_format have a list of format_frame? */
+        if (!vid_fmt->vid_fmt_frm_l) {
+            fmt_dsc->num_frames = htole32(0);
+            g_debug("%s: QueryCapability num_frames = %d", __func__, le32toh(fmt_dsc->num_frames));
+        } else {
+            fmt_frm_l = vid_fmt->vid_fmt_frm_l;
+            fmt_dsc->num_frames = htole32(g_list_length(fmt_frm_l));
+            g_debug("%s: QueryCapability num_frames = %d", __func__, le32toh(fmt_dsc->num_frames));
+
+            /* iterate format_frame list */
+            for (; fmt_frm_l != NULL; fmt_frm_l = fmt_frm_l->next)
+            {
+                vid_fmt_frm = fmt_frm_l->data;
+                memcpy (rbuf->buf_pos, &vid_fmt_frm->frame, sizeof (struct virtio_video_format_frame));
+                //buf_pos += sizeof (struct virtio_video_format_frame);
+                inc_rbuf_pos(rbuf, sizeof (struct virtio_video_format_frame));
+                fmt_frame = (struct virtio_video_format_frame *) rbuf->buf_pos;
+
+                /* does format_frame have a list of frame_rates? */
+                if (!vid_fmt_frm->frm_rate_l) {
+                    fmt_frame->num_rates = htole32(0);
+                    g_debug("%s: QueryCapability num_rates = %d", __func__, le32toh(fmt_frame->num_rates));
+                } else {
+                    frm_rate_l = vid_fmt_frm->frm_rate_l;
+                    fmt_frame->num_rates = htole32(g_list_length(frm_rate_l));
+                    g_debug("%s: QueryCapability num_rates = %d", __func__, le32toh(fmt_frame->num_rates));
+
+                    /* iterate frame_rate list */
+                    for (; frm_rate_l != NULL; frm_rate_l = frm_rate_l->next)
+                    {
+                        vid_fmt_frm_rate = frm_rate_l->data;
+                        memcpy (rbuf->buf_pos, &vid_fmt_frm_rate->frame_rates, sizeof (struct virtio_video_format_range));
+                        inc_rbuf_pos(rbuf, sizeof (struct virtio_video_format_range));
+                    }
+                }
+            }
+        }
+    }
+
+    g_debug("%s: QueryCapability reply size %zu bytes", __func__, rbuf->replysize);
+    debug_capability_reply(rbuf);
+}
+
+void v4l2_backend_free(const struct v4l2_device *dev)
 {
 
     if (dev) {
-    
-        if (dev->output_fmtdesc)
-            g_array_free (dev->output_fmtdesc, TRUE);
-        if (dev->capture_fmtdesc)
-            g_array_free(dev->capture_fmtdesc, TRUE);
 
         if (dev->opened)
             close(dev->fd);
@@ -472,17 +976,14 @@ struct v4l2_device * v4l2_backend_init(const gchar *devname)
         goto err;
     }
 
-    /* enumerate formats */
-    dev->output_fmtdesc = g_array_new(FALSE, FALSE, sizeof(struct v4l2_fmtdesc));
-    dev->capture_fmtdesc = g_array_new(FALSE, FALSE, sizeof(struct v4l2_fmtdesc));
+    GList *vid_output_fmt_l = NULL;
+    GList *vid_capture_fmt_l = NULL;
 
     /* enumerate coded formats on OUTPUT */
-    ret = video_enum_formats( dev, V4L2_BUF_TYPE_VIDEO_OUTPUT,
-                              &dev->num_output_fmtdesc, dev->output_fmtdesc);
+    ret = video_enum_formats( dev, V4L2_BUF_TYPE_VIDEO_OUTPUT, &vid_output_fmt_l, true);
 
     /* enumerate coded formats on CAPTURE */
-    ret = video_enum_formats( dev, V4L2_BUF_TYPE_VIDEO_CAPTURE,
-                              &dev->num_capture_fmtdesc, dev->capture_fmtdesc);
+    ret = video_enum_formats( dev, V4L2_BUF_TYPE_VIDEO_CAPTURE, &vid_capture_fmt_l, true);
 
     if (dev->dev_type & STATEFUL_ENCODER)
         g_print("%s: %s is a stateful encoder (0x%x)!\n", __func__, devname, dev->dev_type);
@@ -490,8 +991,11 @@ struct v4l2_device * v4l2_backend_init(const gchar *devname)
     if (dev->dev_type & STATEFUL_DECODER)
         g_print("%s: %s is a stateful decoder (0x%x)!\n", __func__, devname, dev->dev_type);
 
+    video_free_formats(&vid_output_fmt_l);
+    video_free_formats(&vid_capture_fmt_l);
+
     if (!(dev->dev_type & STATEFUL_ENCODER || dev->dev_type & STATEFUL_DECODER)) {
-        g_printerr("v4l2 device not supported! v4l2 backend only supports stateful devices!\n");
+        g_printerr("v4l2 device not supported! v4l2 backend only supports stateful devices (%d)!\n", dev->dev_type);
         goto err;
     }
 
