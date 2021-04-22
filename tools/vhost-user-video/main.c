@@ -33,7 +33,9 @@
 #include "qemu/iov.h"
 
 #include "v4l2_backend.h"
+#include "virtio_video_helpers.h"
 
+size_t video_iov_size(const struct iovec *iov, const unsigned int iov_cnt);
 
 #ifndef container_of
 #define container_of(ptr, type, member) ({                      \
@@ -96,6 +98,25 @@ static size_t video_iov_to_buf(const struct iovec *iov, const unsigned int iov_c
     return done;
 }
 
+static size_t video_iov_from_buf(const struct iovec *iov, unsigned int iov_cnt,
+                                 size_t offset, const void *buf, size_t bytes)
+{
+    size_t done;
+    unsigned int i;
+    for (i = 0, done = 0; (offset || done < bytes) && i < iov_cnt; i++) {
+        if (offset < iov[i].iov_len) {
+            size_t len = MIN(iov[i].iov_len - offset, bytes - done);
+            memcpy(iov[i].iov_base + offset, buf + done, len);
+            done += len;
+            offset = 0;
+        } else {
+            offset -= iov[i].iov_len;
+        }
+    }
+    assert(offset == 0);
+    return done;
+}
+
 /*
  * Structure to track internal state of VIDEO Device
  */
@@ -141,8 +162,8 @@ video_get_config(VuDev *dev, uint8_t *config, uint32_t len)
     g_return_val_if_fail(len <= sizeof(struct virtio_video_config), -1);
     /* crosvm virtio-video uses 1024 */
     v->virtio_config.version = 0;
-    v->virtio_config.max_caps_length = 1024;
-    v->virtio_config.max_resp_length = 1024;
+    v->virtio_config.max_caps_length = MAX_CAPS_LEN;
+    v->virtio_config.max_resp_length = MAX_CAPS_LEN;
     
     memcpy(config, &v->virtio_config, len);
 
@@ -180,69 +201,69 @@ static void fmt_bytes(GString *s, uint8_t *bytes, int len)
 }
 
 static int
-handle_query_capability_cmd(struct VuVideo *v, struct virtio_video_query_capability *qcmd)
+handle_query_capability_cmd(struct VuVideo *v, struct virtio_video_query_capability *qcmd, replybuf *rbuf)
 {
-    struct virtio_video_query_capability_resp resp;  
-    struct virtio_video_format_desc fmtd;
-    struct virtio_video_format_frame frame_rates;
-    struct virtio_video_format_range fmt_range;
-
-    //v4l2_dev = v->v4l2_dev;
+    GList *fmt_l;
+    int ret;
 
     g_debug("%s: type=0x%x", __func__, le32toh(qcmd->hdr.type));
     g_debug("%s: stream_id=0x%x", __func__, le32toh(qcmd->hdr.stream_id));
     g_debug("%s: queue_type = 0x%x", __func__, le32toh(qcmd->queue_type));
 
-    resp.hdr.type = le32toh(qcmd->hdr.type);
-    resp.hdr.stream_id = le32toh(qcmd->hdr.stream_id);
-
+    //cap_resp->hdr.type = le32toh(qcmd->hdr.type);
+    //cap_resp->hdr.stream_id = le32toh(qcmd->hdr.stream_id);
     
     if (le32toh(qcmd->queue_type) == VIRTIO_VIDEO_QUEUE_TYPE_INPUT) {
         if (v->v4l2_dev->dev_type == STATEFUL_DECODER) {
-            /* We need to return v4l2 output queue */
-            resp.num_descs = htole32(v->v4l2_dev->num_output_fmtdesc);
-            /* TODO to generate mask we need to set each output format, and then enumerate the capture format */
 
-            /* temp hardcod for vicodec decoder */
-            fmtd.mask = htole64(0xFFFFFFF);
-            /* resp.format = v4l2_to_virtio_fmt();*/
-            fmtd.format = VIRTIO_VIDEO_FORMAT_FWHT;
-
-            /* ignore planes_layout and plane_align fields for coded formats */
+            /* enumerate coded formats on OUTPUT */
+            ret = video_enum_formats( v->v4l2_dev, V4L2_BUF_TYPE_VIDEO_OUTPUT, &fmt_l, false);
+            if (ret < 0) {
+                g_printerr("video_enum_formats failed");
+                return ret;
+            }
         }
         if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
             /* TODO not implemented yet */
+            g_critical("%s: TODO STATEFUL_ENCODER not implemented!", __func__);
         }
         /* I think this means 'input queue' to the device e.g. coded data for a decoder or raw data for an encoder */
 
-#if 0
-        fmt_desc = g_malloc(num_output_fmtdesc * sizeof (struct virtio_video_format_desc));
-
-        /* todo I think we need to S_FMT each coded format to see what raw outputs are available */
-                            
-        for (int idx=0; idx < num_output_fmtdesc; idx++) {
-            
-        }
-#endif
-                            
     } else if ((le32toh(qcmd->queue_type) == VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT)) {
+        if (v->v4l2_dev->dev_type == STATEFUL_DECODER) {
 
-            resp.num_descs = htole32(v->v4l2_dev->num_capture_fmtdesc);
-
+            /* enumerate coded formats on INPUT */
+            ret = video_enum_formats( v->v4l2_dev, V4L2_BUF_TYPE_VIDEO_CAPTURE, &fmt_l, false);
+            if (ret < 0) {
+                g_printerr("video_enum_formats failed");
+                return ret;
+            }
+        }
+        if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            /* TODO not implemented yet */
+            g_critical("%s: TODO STATEFUL_ENCODER support not implemented!", __func__);
+        }
     }
+
+    create_query_cap_resp(qcmd, &fmt_l, rbuf);
+
+    video_free_formats(&fmt_l);
 
     return 0;
 }
 
+#if 0
 static void
 video_process_cmd(struct VuVideo *v, struct virtio_video_cmd_hdr *cmd_hdr)
 {
+    virtio_video_query_capability_resp cap_resp = NULL;
+
     g_debug("%s: cmd_hdr=%p",__func__, cmd_hdr);
     switch (le32toh(cmd_hdr->type)) {
     case VIRTIO_VIDEO_CMD_QUERY_CAPABILITY:
         g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY");
         g_debug("sizeof(struct virtio_video_query_capability) = %ld", sizeof(struct virtio_video_query_capability));
-        handle_query_capability_cmd(v, (struct virtio_video_query_capability *) cmd_hdr);
+        cap_resp = handle_query_capability_cmd(v, (struct virtio_video_query_capability *) cmd_hdr);
         break;
     case VIRTIO_VIDEO_CMD_STREAM_CREATE:
         g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY");
@@ -280,9 +301,8 @@ video_process_cmd(struct VuVideo *v, struct virtio_video_cmd_hdr *cmd_hdr)
         g_warning("TODO cmd hdr not known! %x\n", cmd_hdr->type);
 
     }
-
-
 }
+#endif
 
 /* for v3 virtio-video spec currently */
 
@@ -293,6 +313,7 @@ video_handle_ctrl(VuDev *dev, int qidx)
     VuVideo *video = container_of(dev, VuVideo, dev.parent);
     struct virtio_video_cmd_hdr *cmd_hdr = NULL;
     size_t len;
+    replybuf response;
 
     for (;;) {
         VuVirtqElement *elem;
@@ -314,7 +335,71 @@ video_handle_ctrl(VuDev *dev, int qidx)
             g_warning("%s: command hdr size incorrect %zu vs %zu\n",
                       __func__, len, sizeof(cmd_hdr));
         }
-        video_process_cmd(video, cmd_hdr);
+        //video_process_cmd(video, cmd_hdr);
+        g_debug("%s: cmd_hdr=%p",__func__, cmd_hdr);
+
+        switch (le32toh(cmd_hdr->type)) {
+        case VIRTIO_VIDEO_CMD_QUERY_CAPABILITY:
+            g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY");
+
+            response.buf_base = g_malloc(MAX_CAPS_LEN);
+            response.buf_pos = response.buf_base;
+            handle_query_capability_cmd(video, (struct virtio_video_query_capability *) cmd_hdr, &response);
+            
+            if (response.replysize > 0) {
+                g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY: Sending response=0x%p size=%zu", response.buf_base, response.replysize);
+                len = video_iov_from_buf(elem->in_sg,
+                                         elem->in_num, 0, response.buf_base, response.replysize);
+
+                if (len != response.replysize) {
+                    g_critical("%s: response size incorrect %zu vs %zu",
+                               __func__, len, response.replysize);
+                }
+                vu_queue_push(dev, vq, elem, len);
+                vu_queue_notify(dev, vq);
+            }
+
+            g_free(response.buf_base);
+            break;
+
+
+        case VIRTIO_VIDEO_CMD_STREAM_CREATE:
+            g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY");
+        break;
+        case VIRTIO_VIDEO_CMD_STREAM_DESTROY:
+            g_debug("VIRTIO_VIDEO_CMD_STREAM_DESTROY");
+            break;
+        case VIRTIO_VIDEO_CMD_STREAM_DRAIN:
+            g_debug("VIRTIO_VIDEO_CMD_STREAM_DRAIN");
+        case VIRTIO_VIDEO_CMD_RESOURCE_CREATE:
+            g_debug("VIRTIO_VIDEO_CMD_RESOURCE_CREATE");
+            break;
+        case VIRTIO_VIDEO_CMD_RESOURCE_DESTROY_ALL:
+            g_debug("VIRTIO_VIDEO_CMD_RESOURCE_DESTROY_ALL");
+            break;
+        case VIRTIO_VIDEO_CMD_QUEUE_CLEAR:
+            g_debug("VIRTIO_VIDEO_CMD_QUEUE_CLEAR");
+            break;
+        case VIRTIO_VIDEO_CMD_GET_PARAMS:
+            g_debug("VIRTIO_VIDEO_CMD_GET_PARAMS");
+            break;
+        case VIRTIO_VIDEO_CMD_SET_PARAMS:
+            g_debug("VIRTIO_VIDEO_CMD_SET_PARAMS");
+            break;
+        case VIRTIO_VIDEO_CMD_QUERY_CONTROL:
+            g_debug("VIRTIO_VIDEO_CMD_QUERY_CONTROL");
+            break;
+        case VIRTIO_VIDEO_CMD_GET_CONTROL:
+            g_debug("VIRTIO_VIDEO_CMD_GET_CONTROL");
+            break;
+        case VIRTIO_VIDEO_CMD_SET_CONTROL:
+            g_debug("VIRTIO_VIDEO_CMD_SET_CONTROL");
+            break;
+            
+        default:
+            g_debug("Unhandled VIRTIO VIDEO command!");
+            break;
+        }
     }
 }
 
