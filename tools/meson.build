@@ -34,6 +34,6 @@ have_virtiovideo = (have_system and
     have_tools and
     'CONFIG_LINUX' in config_host)
 
-if have_virtiorvideo
+if have_virtiovideo
   subdir('vhost-user-video')
 endif
