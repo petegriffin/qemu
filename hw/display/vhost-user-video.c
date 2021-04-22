@@ -29,7 +29,30 @@
 
 static void vhost_user_video_get_config(VirtIODevice *vdev, uint8_t *config)
 {
-    /* this somehow needs to come from the vhost-user daemon */
+    VHostUserVIDEO *video = VHOST_USER_VIDEO(vdev);
+    struct virtio_video_config *vconfig;
+    int ret;
+    warn_report("%s: ", __func__);
+
+    memset(config, 0, sizeof(struct virtio_video_config));
+#if 1
+    vconfig = (struct virtio_video_config *)config;
+
+    /* for now lets just set it here */
+    vconfig->version = 0;
+    /*TODO FIXME - this needs to match MAX_CAPS_LEN in vhost-user-video daemon */
+    vconfig->max_caps_length = 4096;
+    vconfig->max_resp_length = 4096;
+#endif
+#if 0
+    /* TODO FIXME this fails - but this is what vhost-gpu does */
+    ret = vhost_dev_get_config(&video->vhost_dev,
+                               config, sizeof(struct virtio_video_config));
+    if (ret) {
+        error_report("vhost-user-video: get device config space failed");
+        return;
+    }
+#endif
 }
 
 static void vhost_user_video_start(VirtIODevice *vdev)
