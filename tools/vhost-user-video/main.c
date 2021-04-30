@@ -201,6 +201,30 @@ static void fmt_bytes(GString *s, uint8_t *bytes, int len)
 }
 
 static int
+handle_get_params_cmd(struct VuVideo *v, struct virtio_video_get_params *cmd, struct virtio_video_get_params_resp *resp)
+{
+    int ret;
+    struct v4l2_format fmt;
+    enum v4l2_buf_type buf_type;
+
+    g_debug("%s: type=0x%x", __func__, le32toh(cmd->hdr.type));
+    g_debug("%s: stream_id=0x%x", __func__, le32toh(cmd->hdr.stream_id));
+    g_debug("%s: queue_type = 0x%x", __func__, le32toh(cmd->queue_type));
+
+    resp->params.queue_type = cmd->queue_type;
+
+    buf_type = get_v4l2_buf_type( le32toh(cmd->queue_type), v->v4l2_dev->dev_type);
+
+    ret = v4l2_video_get_format(v->v4l2_dev, buf_type, &fmt);
+    if (ret < 0) {
+        g_printerr("v4l2_video_get_format failed");
+    }
+
+    /* convert from v4l2 to virtio */
+    v4l2_to_virtio_video_params(v->v4l2_dev, &fmt, resp);
+}
+
+static int
 handle_query_capability_cmd(struct VuVideo *v, struct virtio_video_query_capability *qcmd, replybuf *rbuf)
 {
     GList *fmt_l;
@@ -329,6 +353,24 @@ video_handle_ctrl(VuDev *dev, int qidx)
             break;
         case VIRTIO_VIDEO_CMD_GET_PARAMS:
             g_debug("VIRTIO_VIDEO_CMD_GET_PARAMS");
+
+            struct virtio_video_get_params_resp *params_reply;
+            params_reply = g_new0(struct virtio_video_get_params_resp, 1);
+            
+            handle_get_params_cmd(video, (struct virtio_video_get_params *) cmd_hdr, params_reply);
+
+            len = video_iov_from_buf(elem->in_sg,
+                                     elem->in_num, 0, (void*) params_reply,
+                                     sizeof(struct virtio_video_get_params_resp));
+
+            if (len != sizeof(struct virtio_video_get_params_resp)) {
+                    g_critical("%s: response size incorrect %zu vs %zu",
+                               __func__, len, sizeof(params_reply));
+            }
+            vu_queue_push(dev, vq, elem, len);
+            vu_queue_notify(dev, vq);
+            g_free(params_reply);
+
             break;
         case VIRTIO_VIDEO_CMD_SET_PARAMS:
             g_debug("VIRTIO_VIDEO_CMD_SET_PARAMS");
