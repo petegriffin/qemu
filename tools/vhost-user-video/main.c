@@ -252,58 +252,6 @@ handle_query_capability_cmd(struct VuVideo *v, struct virtio_video_query_capabil
     return 0;
 }
 
-#if 0
-static void
-video_process_cmd(struct VuVideo *v, struct virtio_video_cmd_hdr *cmd_hdr)
-{
-    virtio_video_query_capability_resp cap_resp = NULL;
-
-    g_debug("%s: cmd_hdr=%p",__func__, cmd_hdr);
-    switch (le32toh(cmd_hdr->type)) {
-    case VIRTIO_VIDEO_CMD_QUERY_CAPABILITY:
-        g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY");
-        g_debug("sizeof(struct virtio_video_query_capability) = %ld", sizeof(struct virtio_video_query_capability));
-        cap_resp = handle_query_capability_cmd(v, (struct virtio_video_query_capability *) cmd_hdr);
-        break;
-    case VIRTIO_VIDEO_CMD_STREAM_CREATE:
-        g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY");
-        break;
-    case VIRTIO_VIDEO_CMD_STREAM_DESTROY:
-        g_debug("VIRTIO_VIDEO_CMD_STREAM_DESTROY");
-        break;
-    case VIRTIO_VIDEO_CMD_STREAM_DRAIN:
-        g_debug("VIRTIO_VIDEO_CMD_STREAM_DRAIN");
-    case VIRTIO_VIDEO_CMD_RESOURCE_CREATE:
-        g_debug("VIRTIO_VIDEO_CMD_RESOURCE_CREATE");
-        break;
-    case VIRTIO_VIDEO_CMD_RESOURCE_DESTROY_ALL:
-        g_debug("VIRTIO_VIDEO_CMD_RESOURCE_DESTROY_ALL");
-        break;
-    case VIRTIO_VIDEO_CMD_QUEUE_CLEAR:
-        g_debug("VIRTIO_VIDEO_CMD_QUEUE_CLEAR");
-        break;
-    case VIRTIO_VIDEO_CMD_GET_PARAMS:
-        g_debug("VIRTIO_VIDEO_CMD_GET_PARAMS");
-        break;
-    case VIRTIO_VIDEO_CMD_SET_PARAMS:
-        g_debug("VIRTIO_VIDEO_CMD_SET_PARAMS");
-        break;
-    case VIRTIO_VIDEO_CMD_QUERY_CONTROL:
-        g_debug("VIRTIO_VIDEO_CMD_QUERY_CONTROL");
-        break;
-    case VIRTIO_VIDEO_CMD_GET_CONTROL:
-        g_debug("VIRTIO_VIDEO_CMD_GET_CONTROL");
-        break;
-    case VIRTIO_VIDEO_CMD_SET_CONTROL:
-        g_debug("VIRTIO_VIDEO_CMD_SET_CONTROL");
-        break;
-    default:
-        g_warning("TODO cmd hdr not known! %x\n", cmd_hdr->type);
-
-    }
-}
-#endif
-
 /* for v3 virtio-video spec currently */
 
 static void
@@ -361,7 +309,6 @@ video_handle_ctrl(VuDev *dev, int qidx)
 
             g_free(response.buf_base);
             break;
-
 
         case VIRTIO_VIDEO_CMD_STREAM_CREATE:
             g_debug("VIRTIO_VIDEO_CMD_QUERY_CAPABILITY");
