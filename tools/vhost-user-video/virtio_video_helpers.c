@@ -397,3 +397,63 @@ void debug_capability_reply(replybuf *buf)
         }
     }
 }
+
+void v4l2_to_virtio_video_params(struct v4l2_device *dev, struct v4l2_format *fmt, struct virtio_video_get_params_resp *resp)
+{
+    struct virtio_video_params *vid_params = &resp->params;
+    int i;
+
+    /* TODO crop fields missing currently */
+
+    /* min/max_buffers default (taken from crosvm) - maybe different for encoders? */
+    vid_params->min_buffers = 1;
+    vid_params->max_buffers = 32;
+
+    if (video_is_mplane(fmt->type)) {
+
+        vid_params->format = virtio_video_v4l2_format_to_virtio(fmt->fmt.pix.pixelformat);
+        vid_params->frame_width = htole32(fmt->fmt.pix_mp.width);
+        vid_params->frame_height = htole32(fmt->fmt.pix_mp.height);
+       
+        vid_params->num_planes = htole32(fmt->fmt.pix_mp.num_planes);
+
+/*     g_print("%s: Video format: %s (%08x) %ux%u field %s, %u planes: \n",
+               __func__, v4l2_format_name(fmt->fmt.pix_mp.pixelformat),
+               fmt->fmt.pix_mp.pixelformat, fmt->fmt.pix_mp.width, fmt->fmt.pix_mp.height,
+               v4l2_field_name(fmt->fmt.pix_mp.field), fmt->fmt.pix_mp.num_planes);*/
+
+        for (i = 0; i < fmt->fmt.pix_mp.num_planes; i++) {
+
+            vid_params->plane_formats[i].stride = \
+                fmt->fmt.pix_mp.plane_fmt[i].bytesperline;
+
+            vid_params->plane_formats[i].plane_size = \
+                htole32(fmt->fmt.pix_mp.plane_fmt[i].bytesperline ?
+                        fmt->fmt.pix_mp.plane_fmt[i].sizeimage : 0);
+           
+                g_print(" * Stride %u, buffer size %u\n",
+                  fmt->fmt.pix_mp.plane_fmt[i].bytesperline,
+                  fmt->fmt.pix_mp.plane_fmt[i].sizeimage);
+                }
+    } else if (video_is_splane(fmt->type)) {
+        /*g_print("%s: Video format: %s (%08x) %ux%u (stride %u) field %s buffer size %u\n",
+                   __func__, v4l2_format_name(fmt->fmt.pix.pixelformat), fmt->fmt.pix.pixelformat,
+                   fmt->fmt.pix.width, fmt->fmt.pix.height, fmt->fmt.pix.bytesperline,
+                   v4l2_field_name(fmt->fmt.pix_mp.field),
+                   fmt->fmt.pix.sizeimage);*/
+
+        vid_params->format = virtio_video_v4l2_format_to_virtio(fmt->fmt.pix.pixelformat);
+        vid_params->frame_width = htole32(fmt->fmt.pix.width);
+        vid_params->frame_height = htole32(fmt->fmt.pix.height);
+        vid_params->num_planes = htole32(1);
+
+        vid_params->plane_formats[0].stride = \
+            htole32(fmt->fmt.pix.bytesperline);
+
+        vid_params->plane_formats[0].plane_size = \
+            htole32(fmt->fmt.pix.sizeimage);
+
+    } else {
+        g_critical("TODO video_is_meta");
+    }
+}
